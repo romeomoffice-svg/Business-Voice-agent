@@ -1,0 +1,6 @@
+{
+  "name": "Romeo M Studio",
+  "description": "Business communication consulting, content production, and digital product launches with a live AI voice receptionist.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
