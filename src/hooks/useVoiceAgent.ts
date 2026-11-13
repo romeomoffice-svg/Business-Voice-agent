@@ -6,6 +6,24 @@ import type {
   VoiceStatus,
 } from "../types";
 
+function resampleTo16kHz(
+  samples: Float32Array,
+  sourceSampleRate: number
+): Float32Array {
+  if (sourceSampleRate === 16000) return samples;
+  const ratio = sourceSampleRate / 16000;
+  const targetLength = Math.max(1, Math.round(samples.length / ratio));
+  const resampled = new Float32Array(targetLength);
+  for (let i = 0; i < targetLength; i++) {
+    const srcPos = i * ratio;
+    const low = Math.floor(srcPos);
+    const high = Math.min(samples.length - 1, low + 1);
+    const frac = srcPos - low;
+    resampled[i] = samples[low] * (1 - frac) + samples[high] * frac;
+  }
+  return resampled;
+}
+
 function float32ToPcm16Base64(float32: Float32Array): string {
   const pcm16 = new Int16Array(float32.length);
   for (let i = 0; i < float32.length; i++) {
@@ -75,6 +93,9 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
   const statusRef = useRef<VoiceStatus>("idle");
   const rafRef = useRef<number | null>(null);
   const activeTopicRef = useRef<string | undefined>(undefined);
+  const sessionReadyRef = useRef<boolean>(false);
+  const lastPlaybackEndMsRef = useRef<number>(0);
+  const activeSpeakerTurnRef = useRef<"caller" | "receptionist" | null>(null);
   const callbacksRef = useRef(options);
 
   callbacksRef.current = options;
@@ -98,6 +119,9 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
   }, []);
 
   const cleanupAudioAndSocket = useCallback(() => {
+    sessionReadyRef.current = false;
+    activeSpeakerTurnRef.current = null;
+    lastPlaybackEndMsRef.current = 0;
     if (rafRef.current !== null) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
@@ -152,22 +176,21 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
       if (!cleaned) return;
       setTranscript((prev) => {
         const last = prev[prev.length - 1];
-        if (last && last.speaker === speaker) {
-          const needsSpace =
-            last.text.length > 0 &&
-            !/[\s-]$/.test(last.text) &&
-            !/^[\s.,!?;:']/.test(cleaned);
-          const merged = needsSpace
-            ? `${last.text} ${cleaned.trimStart()}`
-            : `${last.text}${cleaned}`;
+        if (
+          last &&
+          last.speaker === speaker &&
+          activeSpeakerTurnRef.current === speaker
+        ) {
+          const merged = `${last.text}${cleaned}`.replace(/\s+/g, " ");
           return [
             ...prev.slice(0, -1),
             {
               ...last,
-              text: merged.replace(/\s+/g, " "),
+              text: merged,
             },
           ];
         }
+        activeSpeakerTurnRef.current = speaker;
         return [
           ...prev,
           {
@@ -202,7 +225,11 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
         source.connect(ctx.destination);
       }
 
-      const startAt = Math.max(ctx.currentTime, nextStartTimeRef.current);
+      // 80ms jitter buffer cushion when starting or recovering from a network gap
+      if (nextStartTimeRef.current <= ctx.currentTime + 0.005) {
+        nextStartTimeRef.current = ctx.currentTime + 0.08;
+      }
+      const startAt = nextStartTimeRef.current;
       nextStartTimeRef.current = startAt + buffer.duration;
 
       activeSourcesRef.current.add(source);
@@ -210,11 +237,11 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
 
       source.onended = () => {
         activeSourcesRef.current.delete(source);
-        if (
-          activeSourcesRef.current.size === 0 &&
-          wsRef.current?.readyState === WebSocket.OPEN
-        ) {
-          setStatusSynced("listening");
+        if (activeSourcesRef.current.size === 0) {
+          lastPlaybackEndMsRef.current = performance.now();
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            setStatusSynced("listening");
+          }
         }
       };
 
@@ -294,7 +321,7 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
           });
           mediaStreamRef.current = stream;
 
-          const inputCtx = new AudioContext({ sampleRate: 16000 });
+          const inputCtx = new AudioContext();
           if (inputCtx.state === "suspended") {
             await inputCtx.resume();
           }
@@ -304,20 +331,34 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
           inputAnalyser.smoothingTimeConstant = 0.7;
 
           const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+          const silentGain = inputCtx.createGain();
+          silentGain.gain.value = 0;
+
           source.connect(inputAnalyser);
           inputAnalyser.connect(processor);
-          processor.connect(inputCtx.destination);
+          processor.connect(silentGain);
+          silentGain.connect(inputCtx.destination);
 
+          const nativeRate = inputCtx.sampleRate;
           processor.onaudioprocess = (event) => {
             if (
+              !sessionReadyRef.current ||
               isMutedRef.current ||
               !wsRef.current ||
               wsRef.current.readyState !== WebSocket.OPEN
             ) {
               return;
             }
+            // Prevent speaker-to-mic echo from cutting off or confusing the live model
+            if (
+              activeSourcesRef.current.size > 0 ||
+              performance.now() - lastPlaybackEndMsRef.current < 320
+            ) {
+              return;
+            }
             const channelData = event.inputBuffer.getChannelData(0);
-            const audio = float32ToPcm16Base64(channelData);
+            const pcm16k = resampleTo16kHz(channelData, nativeRate);
+            const audio = float32ToPcm16Base64(pcm16k);
             wsRef.current.send(JSON.stringify({ audio }));
           };
 
@@ -346,6 +387,7 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
             };
 
             if (msg.type === "ready") {
+              sessionReadyRef.current = true;
               setStatusSynced("listening");
               startVisualizerLoop();
             } else if (msg.type === "audio" && msg.audio) {
@@ -356,9 +398,12 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
               appendTranscriptDelta("receptionist", msg.text);
             } else if (msg.type === "interrupted") {
               stopOutputPlayback();
+              activeSpeakerTurnRef.current = null;
               if (wsRef.current?.readyState === WebSocket.OPEN) {
                 setStatusSynced("listening");
               }
+            } else if (msg.type === "turnComplete") {
+              activeSpeakerTurnRef.current = null;
             } else if (msg.type === "bookingConfirmed" && msg.booking) {
               setBookedCall(msg.booking);
               callbacksRef.current?.onBookingConfirmed?.(
@@ -430,11 +475,21 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
     setIsMuted(next);
   }, []);
 
+  const interruptAndListen = useCallback(() => {
+    stopOutputPlayback();
+    lastPlaybackEndMsRef.current = 0;
+    activeSpeakerTurnRef.current = null;
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      setStatusSynced("listening");
+    }
+  }, [setStatusSynced, stopOutputPlayback]);
+
   const sendTextMessage = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
 
+      activeSpeakerTurnRef.current = null;
       setTranscript((prev) => [
         ...prev,
         {
@@ -530,6 +585,7 @@ export function useVoiceAgent(options?: UseVoiceAgentOptions) {
     startCall,
     endCall,
     toggleMute,
+    interruptAndListen,
     sendTextMessage,
   };
 }

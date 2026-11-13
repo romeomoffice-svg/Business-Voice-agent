@@ -564,6 +564,7 @@ export default function App() {
         onStartCall={(topic) => void voiceAgent.startCall(topic)}
         onEndCall={voiceAgent.endCall}
         onToggleMute={voiceAgent.toggleMute}
+        onInterrupt={voiceAgent.interruptAndListen}
         onSendText={(text) => void voiceAgent.sendTextMessage(text)}
       />
     </div>

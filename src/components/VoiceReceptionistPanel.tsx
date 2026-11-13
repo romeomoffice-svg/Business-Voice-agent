@@ -35,6 +35,7 @@ interface VoiceReceptionistPanelProps {
   onStartCall: (topic?: string) => void;
   onEndCall: () => void;
   onToggleMute: () => void;
+  onInterrupt: () => void;
   onSendText: (text: string) => void;
 }
 
@@ -103,6 +104,7 @@ export function VoiceReceptionistPanel({
   onStartCall,
   onEndCall,
   onToggleMute,
+  onInterrupt,
   onSendText,
 }: VoiceReceptionistPanelProps) {
   const [draft, setDraft] = useState("");
@@ -174,6 +176,17 @@ export function VoiceReceptionistPanel({
             </div>
 
             <div className="flex items-center gap-2">
+              {status === "speaking" && !micUnavailable && (
+                <button
+                  type="button"
+                  onClick={onInterrupt}
+                  className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-[#BFDBFE] bg-[#EFF6FF] px-3.5 py-2 text-sm font-medium text-[#1D4ED8] transition-colors hover:bg-[#DBEAFE] cursor-pointer whitespace-nowrap"
+                >
+                  <Mic className="h-4 w-4" aria-hidden="true" />
+                  <span>Speak Now</span>
+                </button>
+              )}
+
               {isActive && !micUnavailable && (
                 <button
                   type="button"
